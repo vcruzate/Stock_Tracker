@@ -53,35 +53,77 @@ def get_tickers():
         return []
 
 
-def download_in_batches(tickers, batch_size=500, pause_sec=1):
-    """Descarga historial de 1 año por lotes rápidos incluyendo SPY y ETFs de referencia."""
-    ref_etfs = sorted(set(INDUSTRY_OR_SECTOR_ETF_MAP.values()))
-    symbols = sorted(set(tickers + ["SPY"] + ref_etfs))
-    frames = []
-    total_batches = (len(symbols) + batch_size - 1) // batch_size
-
-    for idx in range(0, len(symbols), batch_size):
-        batch_num = idx // batch_size + 1
-        batch = symbols[idx : idx + batch_size]
-        print(f"📥 Lote {batch_num}/{total_batches} ({len(batch)} símbolos)...")
+def download_single_batch(batch, retries=2, retry_wait=12):
+    """Descarga un lote con reintento suave ante fallos temporales o rate limit."""
+    for attempt in range(retries + 1):
         try:
-            df_batch = yf.download(
+            df = yf.download(
                 batch,
                 period="1y",
                 group_by="ticker",
-                threads=True,
+                threads=False,
                 progress=False,
             )
-            if df_batch is not None and not df_batch.empty:
-                frames.append(df_batch)
+            if df is not None and not df.empty:
+                return df
         except Exception as e:
-            print(f"⚠️ Error en lote {batch_num}: {e}")
+            if attempt == retries:
+                print(f"⚠️ Error definitivo en lote ({len(batch)} símbolos): {e}")
+
+        if attempt < retries:
+            time.sleep(retry_wait * (attempt + 1))
+
+    return pd.DataFrame()
+
+
+def download_priority_benchmarks():
+    """Descarga primero SPY y los ETFs de referencia de forma aislada y con reintento."""
+    ref_etfs = sorted(set(INDUSTRY_OR_SECTOR_ETF_MAP.values()))
+    benchmarks = sorted(set(["SPY"] + ref_etfs))
+    print(f"📌 Descargando benchmarks prioritarios ({len(benchmarks)} símbolos: SPY + ETFs)...")
+
+    df_bench = download_single_batch(benchmarks, retries=3, retry_wait=10)
+    if df_bench.empty or not isinstance(df_bench.columns, pd.MultiIndex):
+        print("🔄 Reintentando descarga individual de SPY...")
+        df_spy = download_single_batch(["SPY"], retries=3, retry_wait=12)
+        if not df_spy.empty:
+            return df_spy
+        return pd.DataFrame()
+
+    available = set(df_bench.columns.get_level_values(0).unique())
+    if "SPY" not in available:
+        print("🔄 SPY no vino en el lote de benchmarks; reintentando solo SPY...")
+        df_spy = download_single_batch(["SPY"], retries=3, retry_wait=12)
+        if not df_spy.empty:
+            combined = pd.concat([df_bench, df_spy], axis=1)
+            return combined.loc[:, ~combined.columns.duplicated()]
+
+    return df_bench
+
+
+def download_in_batches(tickers, batch_size=200, pause_sec=4):
+    """Descarga historial de 1 año por lotes moderados conservando SPY y ETFs de referencia."""
+    df_bench = download_priority_benchmarks()
+    if df_bench.empty:
+        return pd.DataFrame()
+
+    ref_etfs = set(INDUSTRY_OR_SECTOR_ETF_MAP.values())
+    excluded = {"SPY"} | ref_etfs
+    remaining_tickers = [t for t in sorted(set(tickers)) if t not in excluded]
+
+    frames = [df_bench]
+    total_batches = (len(remaining_tickers) + batch_size - 1) // batch_size
+
+    for idx in range(0, len(remaining_tickers), batch_size):
+        batch_num = idx // batch_size + 1
+        batch = remaining_tickers[idx : idx + batch_size]
+        print(f"📥 Lote {batch_num}/{total_batches} ({len(batch)} símbolos)...")
+        df_batch = download_single_batch(batch, retries=2, retry_wait=12)
+        if not df_batch.empty:
+            frames.append(df_batch)
 
         if batch_num < total_batches and pause_sec > 0:
             time.sleep(pause_sec)
-
-    if not frames:
-        return pd.DataFrame()
 
     combined = pd.concat(frames, axis=1)
     combined = combined.loc[:, ~combined.columns.duplicated()]
@@ -142,12 +184,12 @@ def get_asset_meta(ticker):
 
 def scan_market():
     t0 = time.time()
-    print("🚀 Iniciando escáner rápido (Precio >= $10 | Vol 20d >= 300k antes de .info)...")
+    print("🚀 Iniciando escáner (Benchmarks prioritarios + Filtro rápido antes de .info)...")
     tickers = get_tickers()
     if not tickers:
         return
 
-    data = download_in_batches(tickers, batch_size=500, pause_sec=1)
+    data = download_in_batches(tickers, batch_size=200, pause_sec=4)
     if data.empty or not isinstance(data.columns, pd.MultiIndex):
         print("❌ No se obtuvieron datos históricos válidos.")
         return
@@ -169,7 +211,6 @@ def scan_market():
 
     candidates_pre = []
 
-    # 1. Embudo rápido previo: precio, volumen 20d y Trend Template (sin llamadas .info)
     for ticker in tickers:
         if (
             ticker == "SPY"
@@ -189,7 +230,7 @@ def scan_market():
             price = float(close.iloc[-1])
             avg_vol_20d = float(volume.tail(20).mean())
 
-            # Filtros rápidos de liquidez y precio antes de cualquier cálculo pesado
+            # Filtros base de precio y liquidez mínima
             if price < 10.0 or avg_vol_20d < 300_000:
                 continue
 
@@ -253,7 +294,9 @@ def scan_market():
         except Exception:
             continue
 
-    print(f"🎯 Candidatas tras filtros rápidos: {len(candidates_pre)} (consultando .info solo para ellas)")
+    print(
+        f"🎯 Candidatas tras filtros rápidos: {len(candidates_pre)} (consultando .info solo para ellas)"
+    )
 
     rows = []
     for item in candidates_pre:
@@ -419,7 +462,9 @@ def scan_market():
             f"✅ Guardadas {len(df_out)} candidatas en {output_file} ({time.time() - t0:.1f}s)"
         )
     else:
-        print(f"⚠️ Ninguna acción cumplió los filtros en esta corrida ({time.time() - t0:.1f}s).")
+        print(
+            f"⚠️ Ninguna acción cumplió los filtros en esta corrida ({time.time() - t0:.1f}s)."
+        )
 
 
 if __name__ == "__main__":
