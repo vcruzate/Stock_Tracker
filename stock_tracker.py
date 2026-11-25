@@ -4,7 +4,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# Mapeo de referencia por sector/industria a ETF
+# Mapeo de referencia por sector/industria a ETF (con respaldo a SPY si no hay ETF específico)
 INDUSTRY_OR_SECTOR_ETF_MAP = {
     "Semiconductors": "SMH",
     "Semiconductor Equipment & Materials": "SMH",
@@ -53,8 +53,8 @@ def get_tickers():
         return []
 
 
-def download_in_batches(tickers, batch_size=250, pause_sec=3):
-    """Descarga historial de 1 año por lotes incluyendo SPY y ETFs de referencia."""
+def download_in_batches(tickers, batch_size=500, pause_sec=1):
+    """Descarga historial de 1 año por lotes rápidos incluyendo SPY y ETFs de referencia."""
     ref_etfs = sorted(set(INDUSTRY_OR_SECTOR_ETF_MAP.values()))
     symbols = sorted(set(tickers + ["SPY"] + ref_etfs))
     frames = []
@@ -69,7 +69,7 @@ def download_in_batches(tickers, batch_size=250, pause_sec=3):
                 batch,
                 period="1y",
                 group_by="ticker",
-                threads=False,
+                threads=True,
                 progress=False,
             )
             if df_batch is not None and not df_batch.empty:
@@ -77,7 +77,7 @@ def download_in_batches(tickers, batch_size=250, pause_sec=3):
         except Exception as e:
             print(f"⚠️ Error en lote {batch_num}: {e}")
 
-        if batch_num < total_batches:
+        if batch_num < total_batches and pause_sec > 0:
             time.sleep(pause_sec)
 
     if not frames:
@@ -141,12 +141,13 @@ def get_asset_meta(ticker):
 
 
 def scan_market():
-    print("🚀 Iniciando escáner (Precio >= $10 | Vol 20d >= 300k)...")
+    t0 = time.time()
+    print("🚀 Iniciando escáner rápido (Precio >= $10 | Vol 20d >= 300k antes de .info)...")
     tickers = get_tickers()
     if not tickers:
         return
 
-    data = download_in_batches(tickers, batch_size=250, pause_sec=3)
+    data = download_in_batches(tickers, batch_size=500, pause_sec=1)
     if data.empty or not isinstance(data.columns, pd.MultiIndex):
         print("❌ No se obtuvieron datos históricos válidos.")
         return
@@ -166,8 +167,9 @@ def scan_market():
         if etf in available:
             etf_ret_80[etf] = calc_period_return(data[etf]["Close"], lookback=80)
 
-    rows = []
+    candidates_pre = []
 
+    # 1. Embudo rápido previo: precio, volumen 20d y Trend Template (sin llamadas .info)
     for ticker in tickers:
         if (
             ticker == "SPY"
@@ -185,24 +187,11 @@ def scan_market():
                 continue
 
             price = float(close.iloc[-1])
-            last_vol = float(volume.iloc[-1])
             avg_vol_20d = float(volume.tail(20).mean())
-            avg_vol_50d = float(volume.tail(50).mean())
-            avg_vol_5d = float(volume.tail(5).mean())
 
-            # Filtros base de precio y liquidez mínima (>= $10 y >= 300k vol)
+            # Filtros rápidos de liquidez y precio antes de cualquier cálculo pesado
             if price < 10.0 or avg_vol_20d < 300_000:
                 continue
-
-            rvol_20d = (last_vol / avg_vol_20d) if avg_vol_20d > 0 else np.nan
-            dry_up_5d_vs_50d = (
-                (avg_vol_5d / avg_vol_50d) if avg_vol_50d > 0 else np.nan
-            )
-            min_vol_10d_vs_50d = (
-                (float(volume.tail(10).min()) / avg_vol_50d)
-                if avg_vol_50d > 0
-                else np.nan
-            )
 
             sma200 = float(close.rolling(200).mean().iloc[-1])
             sma150 = float(close.rolling(150).mean().iloc[-1])
@@ -241,6 +230,65 @@ def scan_market():
 
             if not cond_trend:
                 continue
+
+            candidates_pre.append(
+                (
+                    ticker,
+                    df_s,
+                    close,
+                    volume,
+                    price,
+                    avg_vol_20d,
+                    sma200,
+                    sma150,
+                    sma50,
+                    sma200_slope,
+                    trend_sma200,
+                    high_52w,
+                    low_52w,
+                    vs_low52,
+                    vs_high52,
+                )
+            )
+        except Exception:
+            continue
+
+    print(f"🎯 Candidatas tras filtros rápidos: {len(candidates_pre)} (consultando .info solo para ellas)")
+
+    rows = []
+    for item in candidates_pre:
+        (
+            ticker,
+            df_s,
+            close,
+            volume,
+            price,
+            avg_vol_20d,
+            sma200,
+            sma150,
+            sma50,
+            sma200_slope,
+            trend_sma200,
+            high_52w,
+            low_52w,
+            vs_low52,
+            vs_high52,
+        ) = item
+
+        try:
+            last_vol = float(volume.iloc[-1])
+            avg_vol_50d = float(volume.tail(50).mean())
+            avg_vol_5d = float(volume.tail(5).mean())
+
+            rvol_20d = (last_vol / avg_vol_20d) if avg_vol_20d > 0 else np.nan
+            dry_up_5d_vs_50d = (
+                (avg_vol_5d / avg_vol_50d) if avg_vol_50d > 0 else np.nan
+            )
+            min_vol_10d_vs_50d = (
+                (float(volume.tail(10).min()) / avg_vol_50d)
+                if avg_vol_50d > 0
+                else np.nan
+            )
 
             stock_ret_80 = calc_period_return(close, lookback=80)
             rs_vs_spy = (
@@ -367,9 +415,11 @@ def scan_market():
         df_out = df_out.sort_values(by="Python Score (85)", ascending=False)
 
         df_out.to_csv(output_file, index=False, encoding="utf-8-sig")
-        print(f"✅ Guardadas {len(df_out)} candidatas en {output_file}")
+        print(
+            f"✅ Guardadas {len(df_out)} candidatas en {output_file} ({time.time() - t0:.1f}s)"
+        )
     else:
-        print("⚠️ Ninguna acción cumplió los filtros en esta corrida.")
+        print(f"⚠️ Ninguna acción cumplió los filtros en esta corrida ({time.time() - t0:.1f}s).")
 
 
 if __name__ == "__main__":
