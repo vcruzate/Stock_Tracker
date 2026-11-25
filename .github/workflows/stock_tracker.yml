@@ -3,8 +3,11 @@ name: Screener Minervini Diario
 on:
   schedule:
     # Se ejecuta de Lunes a Viernes a las 22:30 UTC (17:30 / 18:30 hora Chile / NY)
-    - cron: '30 22 * * 1-5'
+    - cron: '30 22 * * 1'
   workflow_dispatch: # Permite ejecutarlo manualmente desde un botón cuando quieras
+
+permissions: 
+  contents: write
 
 jobs:
   run-screener:
