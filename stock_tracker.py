@@ -59,7 +59,7 @@ def download_single_batch(batch, retries=2, retry_wait=12):
         try:
             df = yf.download(
                 batch,
-                period="1y",
+                period="2y",
                 group_by="ticker",
                 threads=False,
                 progress=False,
@@ -130,7 +130,7 @@ def download_in_batches(tickers, batch_size=200, pause_sec=4):
     return combined
 
 
-def calc_period_return(close_series, lookback=252):
+def calc_period_return(close_series, lookback=250):
     """Retorno porcentual en lookback ruedas (por defecto 252 ruedas = 52 semanas)."""
     s = close_series.dropna()
     if len(s) <= lookback:
