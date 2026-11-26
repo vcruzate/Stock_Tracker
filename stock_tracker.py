@@ -4,7 +4,11 @@ import pandas as pd
 import requests
 import yfinance as yf
 
-# Mapeo de referencia por sector/industria a ETF (con respaldo a SPY si no hay ETF específico)
+# ==============================================================================
+# 1. MAPEO DE REFERENCIA SECTORIAL Y DE INDUSTRIA A ETFS BENCHMARK
+# ==============================================================================
+# Asigna cada subgrupo industrial o sector a su ETF de referencia correspondiente.
+# Si la industria no se encuentra en la lista, el script utilizará SPY como respaldo.
 INDUSTRY_OR_SECTOR_ETF_MAP = {
     "Semiconductors": "SMH",
     "Semiconductor Equipment & Materials": "SMH",
@@ -28,8 +32,14 @@ INDUSTRY_OR_SECTOR_ETF_MAP = {
 }
 
 
+# ==============================================================================
+# 2. FUNCIONES DE DESCARGA Y GESTIÓN DE DATOS HISTÓRICOS
+# ==============================================================================
 def get_tickers():
-    """Descarga tickers de EE. UU. y limpia símbolos no estándar."""
+    """
+    Descarga la lista actualizada de tickers de acciones de EE. UU. desde GitHub 
+    y limpia los símbolos no estándar (warrants, acciones preferentes, etc.).
+    """
     try:
         url = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt"
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -54,12 +64,16 @@ def get_tickers():
 
 
 def download_single_batch(batch, retries=2, retry_wait=12):
-    """Descarga un lote con reintento suave ante fallos temporales o rate limit."""
+    """
+    Descarga un conjunto o lote de símbolos mediante yfinance utilizando un período
+    de 2 años para contar con un colchón suficiente de días bursátiles (>= 252 ruedas).
+    Incluye un mecanismo de reintentos ante fallos temporales o límites de cuota (Rate Limit).
+    """
     for attempt in range(retries + 1):
         try:
             df = yf.download(
                 batch,
-                period="2y",
+                period="2y",  # Período extendido a 2 años para asegurar la ventana de 52 semanas
                 group_by="ticker",
                 threads=False,
                 progress=False,
@@ -77,7 +91,10 @@ def download_single_batch(batch, retries=2, retry_wait=12):
 
 
 def download_priority_benchmarks():
-    """Descarga primero SPY y los ETFs de referencia de forma aislada y con reintento."""
+    """
+    Descarga de forma prioritaria y aislada el índice SPY y los ETFs de referencia.
+    Garantiza que las métricas de Fuerza Relativa tengan benchmarks válidos desde el inicio.
+    """
     ref_etfs = sorted(set(INDUSTRY_OR_SECTOR_ETF_MAP.values()))
     benchmarks = sorted(set(["SPY"] + ref_etfs))
     print(f"📌 Descargando benchmarks prioritarios ({len(benchmarks)} símbolos: SPY + ETFs)...")
@@ -102,7 +119,10 @@ def download_priority_benchmarks():
 
 
 def download_in_batches(tickers, batch_size=200, pause_sec=4):
-    """Descarga historial de 1 año por lotes moderados conservando SPY y ETFs de referencia."""
+    """
+    Divide y procesa la descarga del mercado general en lotes moderados para evitar 
+    bloqueos por peticiones masivas, concatenando los datos descargados con los benchmarks.
+    """
     df_bench = download_priority_benchmarks()
     if df_bench.empty:
         return pd.DataFrame()
@@ -130,8 +150,14 @@ def download_in_batches(tickers, batch_size=200, pause_sec=4):
     return combined
 
 
-def calc_period_return(close_series, lookback=250):
-    """Retorno porcentual en lookback ruedas (por defecto 252 ruedas = 52 semanas)."""
+# ==============================================================================
+# 3. FUNCIONES DE CÁLCULO ESTADÍSTICO Y MÉTRICAS TÉCNICAS
+# ==============================================================================
+def calc_period_return(close_series, lookback=252):
+    """
+    Calcula el rendimiento porcentual de una serie de cierres en la ventana especificada.
+    Por defecto utiliza 252 ruedas de negociación (1 año bursátil / 52 semanas).
+    """
     s = close_series.dropna()
     if len(s) <= lookback:
         return None
@@ -143,7 +169,10 @@ def calc_period_return(close_series, lookback=250):
 
 
 def ols_slope_normalized(close_series, n_bars):
-    """Pendiente de regresión lineal (OLS) normalizada sobre los últimos n_bars cierres."""
+    """
+    Calcula la pendiente de regresión lineal (OLS) normalizada sobre los últimos n_bars cierres.
+    Divide la pendiente obtenida entre el primer precio del rango para obtener una tasa de cambio comparable.
+    """
     s = close_series.dropna().tail(n_bars)
     if len(s) < max(5, n_bars // 2):
         return np.nan
@@ -155,7 +184,10 @@ def ols_slope_normalized(close_series, n_bars):
 
 
 def up_down_volume_ratio(df_ohlcv, n_bars=25):
-    """Proporción de volumen en días al alza vs días a la baja en las últimas n_bars ruedas."""
+    """
+    Calcula el ratio entre el volumen transado en días al alza vs. el volumen transado en días a la baja 
+    en un horizonte de n_bars ruedas (~5 semanas).
+    """
     sub = df_ohlcv[["Close", "Volume"]].dropna().tail(n_bars + 1)
     if len(sub) < 2:
         return np.nan
@@ -169,7 +201,10 @@ def up_down_volume_ratio(df_ohlcv, n_bars=25):
 
 
 def get_asset_meta(ticker):
-    """Obtiene nombre, sector, industria y marketCap con respaldo seguro."""
+    """
+    Consulta la información fundamental de la empresa (Yahoo Finance info) únicamente
+    para los activos pre-filtrados para extraer Nombre, Sector, Industria y Capitalización Bursátil.
+    """
     try:
         info = yf.Ticker(ticker).info
         name = info.get("shortName") or info.get("longName") or ticker
@@ -182,52 +217,35 @@ def get_asset_meta(ticker):
         return ticker, "Unknown", "Unknown", np.nan
 
 
+# ==============================================================================
+# 4. MODELO DE SCORING Y EVALUACIÓN DE NOTAS (MÁXIMO 75 PUNTOS TÓTAL)
+# ==============================================================================
 def calc_score_aceleracion(ar):
     """
-    Sub-bloque Acel OLS (AR): Máx 20 Puntos
-    1.00 <= AR <= 1.30: 20 pts
-    1.30 < AR <= 2.00: 14 pts
-    AR > 2.00: 8 pts
-    0.00 < AR < 1.00: 8 pts
-    AR <= 0.00: 0 pts
+    Sub-bloque A: Aceleración OLS de la SMA 200 (AR = Beta 5w / Beta 30w) (Máximo 20 Puntos).
+    Puntúa el comportamiento de la aceleración según el tramo del indicador AR.
     """
     if pd.isna(ar):
         return 0.0
     if 1.00 <= ar <= 1.30:
-        return 20.0
-    elif 1.30 < ar <= 2.00:
-        return 14.0
-    elif ar > 2.00:
-        return 8.0
-    elif 0.00 < ar < 1.00:
-        return 8.0
-    else:
-        return 0.0
+        return 20.0  # Zona dulce / Aceleración fresca
+    if 1.30 < ar <= 2.00:
+        return 14.0  # Aceleración sólida y consolidada
+    if ar > 2.00:
+        return 8.0   # Movimiento sobreextendido / muy acelerado
+    if 0.00 < ar < 1.00:
+        return 8.0   # Aceleración lenta o incipiente
+    return 0.0       # AR <= 0: Sin aceleración o retroceso
 
 
 def calc_score_timing(ud_ratio, rvol_3d_20d, dist_sma50):
     """
-    Sub-bloque Timing & Volumen: Máx 25 Puntos Totales
-    - U/D Ratio (Máx 11 pts):
-      U/D >= 2.00: 11 pts
-      1.50 <= U/D < 2.00: 8 pts
-      1.20 <= U/D < 1.50: 5 pts
-      1.00 < U/D < 1.20: 2 pts
-      U/D <= 1.00: 0 pts
-
-    - RVOL 3d/20d (Máx 4 pts):
-      1.10 <= RVOL <= 1.80: 4 pts
-      0.80 <= RVOL < 1.10: 2 pts
-      RVOL > 1.80: 2 pts (si U/D > 1.2) / 1 pt (si U/D <= 1.2)
-      RVOL < 0.80: 0 pts
-
-    - Distancia a SMA 50 (Máx 10 pts):
-      +0.1% <= Dist_SMA50 <= +3.0%: 10 pts
-      +3.1% <= Dist_SMA50 <= +6.0%: 7 pts
-      +6.1% <= Dist_SMA50 <= +10.0%: 3 pts
-      Dist_SMA50 < 0% o > +10.0%: 0 pts
+    Sub-bloque B: Timing & Volumen (Máximo 25 Puntos Totales).
+    - Up/Down Volume Ratio (Máx. 11 pts)
+    - Aceleración Corta de Volumen RVOL 3d/20d (Máx. 4 pts)
+    - Proximidad/Distancia a la SMA 50 (Máx. 10 pts)
     """
-    # 1. U/D Ratio
+    # 1. Up/Down Volume Ratio (Máx 11 Puntos)
     if pd.isna(ud_ratio) or ud_ratio <= 1.00:
         score_ud = 0.0
     elif ud_ratio >= 2.00:
@@ -239,47 +257,37 @@ def calc_score_timing(ud_ratio, rvol_3d_20d, dist_sma50):
     else:  # 1.00 < ud_ratio < 1.20
         score_ud = 2.0
 
-    # 2. RVOL 3d/20d
+    # 2. RVOL 3d/20d (Máx 4 Puntos)
     if pd.isna(rvol_3d_20d) or rvol_3d_20d < 0.80:
         score_rvol = 0.0
     elif 1.10 <= rvol_3d_20d <= 1.80:
         score_rvol = 4.0
     elif 0.80 <= rvol_3d_20d < 1.10:
         score_rvol = 2.0
-    else:  # rvol_3d_20d > 1.80
+    else:  # RVOL > 1.80
         score_rvol = 2.0 if (pd.notna(ud_ratio) and ud_ratio > 1.20) else 1.0
 
-    # 3. Distancia SMA 50 (%)
+    # 3. Distancia a la SMA 50 (%) (Máx 10 Puntos)
     dist_pct = dist_sma50 * 100.0 if pd.notna(dist_sma50) else -999.0
     if 0.1 <= dist_pct <= 3.0:
-        score_dist = 10.0
-    elif 3.1 <= dist_pct <= 6.0:
-        score_dist = 7.0
-    elif 6.1 <= dist_pct <= 10.0:
-        score_dist = 3.0
+        score_dist = 10.0  # Entrada de muy bajo riesgo (Low Risk Entry)
+    elif 3.0 < dist_pct <= 6.0:
+        score_dist = 7.0   # Buen timing de entrada
+    elif 6.0 < dist_pct <= 10.0:
+        score_dist = 3.0   # Extendido
     else:
-        score_dist = 0.0
+        score_dist = 0.0   # Fuera de rango (debajo de la SMA50 o >10%)
 
     return round(score_ud + score_rvol + score_dist, 1)
 
 
 def calc_score_rs(rs_vs_spy, rs_ind_val, rank_ind):
     """
-    Sub-bloque Relative Strength: Máx 30 Puntos Totales
-    - RS vs SPY (Máx 20 pts):
-      RS_vs_SPY >= 0.75: 20 pts
-      0.50 <= RS_vs_SPY < 0.75: 15 pts
-      0.25 <= RS_vs_SPY < 0.50: 10 pts
-      0.00 < RS_vs_SPY < 0.25: 5 pts
-      RS_vs_SPY <= 0.00: 0 pts
-
-    - RS vs Industria / Ranking (Máx 10 pts):
-      RS_Ind >= 115 o Top 1-3 en industria: 10 pts
-      105 <= RS_Ind < 115 o Top 4-5 en industria: 5 pts
-      100 < RS_Ind < 105 o Top 6-10 en industria: 0 pts
-      RS_Ind <= 100 o fuera de Top 10: 0 pts
+    Sub-bloque C: Fuerza Relativa (Máximo 30 Puntos Totales).
+    - Fuerza Relativa vs SPY (52 semanas) (Máx. 20 pts)
+    - Ranking de Industria por Capitalización Bursátil (Máx. 10 pts)
     """
-    # 1. RS vs SPY
+    # 1. RS vs SPY (52 semanas)
     if pd.isna(rs_vs_spy) or rs_vs_spy <= 0.00:
         score_spy = 0.0
     elif rs_vs_spy >= 0.75:
@@ -288,18 +296,18 @@ def calc_score_rs(rs_vs_spy, rs_ind_val, rank_ind):
         score_spy = 15.0
     elif 0.25 <= rs_vs_spy < 0.50:
         score_spy = 10.0
-    else:  # 0.00 < rs_vs_spy < 0.25
+    else:  # 0.00 < RS_vs_SPY < 0.25
         score_spy = 5.0
 
-    # 2. RS vs Industria / Ranking
+    # 2. Ranking de Industria por MktCap
     score_ind = 0.0
     if pd.notna(rank_ind) and rank_ind != "":
         try:
             r = int(rank_ind)
             if 1 <= r <= 3:
-                score_ind = 10.0
+                score_ind = 10.0  # Liderazgo de industria (Top 1-3)
             elif 4 <= r <= 5:
-                score_ind = 5.0
+                score_ind = 5.0   # Top 4-5
             else:
                 score_ind = 0.0
         except ValueError:
@@ -316,6 +324,9 @@ def calc_score_rs(rs_vs_spy, rs_ind_val, rank_ind):
     return round(score_spy + score_ind, 1)
 
 
+# ==============================================================================
+# 5. MOTOR PRINCIPAL DEL ESCÁNER Y PROCESAMIENTO DEL CSV
+# ==============================================================================
 def scan_market():
     t0 = time.time()
     print("🚀 Iniciando escáner (Benchmarks prioritarios + Filtros cuantitativos)...")
@@ -323,6 +334,7 @@ def scan_market():
     if not tickers:
         return
 
+    # Descarga por lotes del mercado completo
     data = download_in_batches(tickers, batch_size=200, pause_sec=4)
     if data.empty or not isinstance(data.columns, pd.MultiIndex):
         print("❌ No se obtuvieron datos históricos válidos.")
@@ -333,12 +345,14 @@ def scan_market():
         print("❌ Falta SPY en los datos descargados.")
         return
 
+    # Retornos base de SPY a 52 semanas y a 80 ruedas
     spy_ret_52w = calc_period_return(data["SPY"]["Close"], lookback=252)
     spy_ret_80 = calc_period_return(data["SPY"]["Close"], lookback=80)
     if spy_ret_52w is None:
         print("❌ Historial insuficiente de SPY.")
         return
 
+    # Retornos de referencia para los ETFs de sector/industria
     etf_ret_80 = {}
     for etf in set(INDUSTRY_OR_SECTOR_ETF_MAP.values()):
         if etf in available:
@@ -346,6 +360,9 @@ def scan_market():
 
     candidates_pre = []
 
+    # --------------------------------------------------------------------------
+    # PASO 5A: EVALUACIÓN DE FILTROS BASE Y FILTROS OBLIGATORIOS BINARIOS
+    # --------------------------------------------------------------------------
     for ticker in tickers:
         if (
             ticker == "SPY"
@@ -365,12 +382,11 @@ def scan_market():
             price = float(close.iloc[-1])
             avg_vol_20d = float(volume.tail(20).mean())
 
-            # Filtros base de precio y liquidez mínima
+            # Filtros iniciales de liquidez y precio
             if price < 10.0 or avg_vol_20d < 300_000:
                 continue
 
-            # --- FILTROS OBLIGATORIOS NUEVOS ---
-            # 1. Fuerza Relativa Positiva (RS_vs_SPY 52w > 0)
+            # FILTRO OBLIGATORIO 1: Fuerza Relativa Positiva (RS 52w vs SPY > 0)
             stock_ret_52w = calc_period_return(close, lookback=252)
             if stock_ret_52w is None:
                 continue
@@ -378,13 +394,13 @@ def scan_market():
             if rs_vs_spy_52w <= 0.0:
                 continue
 
-            # 2. RVOL 3d / 20d > 0.80
+            # FILTRO OBLIGATORIO 2: Volumen Reciente Promedio (RVOL 3d/20d > 0.80)
             avg_vol_3d = float(volume.tail(3).mean())
             rvol_3d_20d = (avg_vol_3d / avg_vol_20d) if avg_vol_20d > 0 else 0.0
             if rvol_3d_20d <= 0.80:
                 continue
 
-            # 3. Variable AR (Beta 5w / Beta 30w) > 0.0
+            # FILTRO OBLIGATORIO 3: Variable AR (Ratio Beta 5w / Beta 30w) > 0.0
             ols_5w = ols_slope_normalized(close, n_bars=25)
             ols_30w = ols_slope_normalized(close, n_bars=150)
             if pd.isna(ols_5w) or pd.isna(ols_30w) or ols_30w <= 0:
@@ -395,7 +411,7 @@ def scan_market():
             if pd.isna(ar_val) or ar_val <= 0.0:
                 continue
 
-            # --- TREND TEMPLATE ---
+            # ESTRUCTURA TÉCNICA: Trend Template de Mark Minervini (Etapa 2)
             sma200 = float(close.rolling(200).mean().iloc[-1])
             sma150 = float(close.rolling(150).mean().iloc[-1])
             sma50 = float(close.rolling(50).mean().iloc[-1])
@@ -442,13 +458,11 @@ def scan_market():
                     volume,
                     price,
                     avg_vol_20d,
-                    avg_vol_3d,
                     rvol_3d_20d,
                     sma200,
                     sma150,
                     sma50,
                     sma200_slope,
-                    trend_sma200,
                     high_52w,
                     low_52w,
                     vs_low52,
@@ -466,6 +480,9 @@ def scan_market():
         f"🎯 Candidatas tras filtros rápidos: {len(candidates_pre)} (consultando .info solo para ellas)"
     )
 
+    # --------------------------------------------------------------------------
+    # PASO 5B: EXTRACCIÓN DE METADATOS Y ENSAMBLADO DE VARIABLES
+    # --------------------------------------------------------------------------
     rows = []
     for item in candidates_pre:
         (
@@ -475,13 +492,11 @@ def scan_market():
             volume,
             price,
             avg_vol_20d,
-            avg_vol_3d,
             rvol_3d_20d,
             sma200,
             sma150,
             sma50,
             sma200_slope,
-            trend_sma200,
             high_52w,
             low_52w,
             vs_low52,
@@ -493,7 +508,6 @@ def scan_market():
         ) = item
 
         try:
-            last_vol = float(volume.iloc[-1])
             avg_vol_50d = float(volume.tail(50).mean())
             avg_vol_5d = float(volume.tail(5).mean())
 
@@ -507,10 +521,8 @@ def scan_market():
             )
 
             stock_ret_80 = calc_period_return(close, lookback=80)
-            rs_vs_spy_80 = (
-                (stock_ret_80 - spy_ret_80) if stock_ret_80 is not None else 0.0
-            )
 
+            # Obtención de metadatos del activo (Yahoo Finance .info)
             name, sector, industry, market_cap = get_asset_meta(ticker)
             ref_etf = INDUSTRY_OR_SECTOR_ETF_MAP.get(
                 industry, INDUSTRY_OR_SECTOR_ETF_MAP.get(sector, "SPY")
@@ -519,12 +531,13 @@ def scan_market():
             rs_vs_sector = (
                 (stock_ret_80 - ref_ret)
                 if (stock_ret_80 is not None and ref_ret is not None)
-                else rs_vs_spy_80
+                else rs_vs_spy_52w
             )
 
             up_down_5w = up_down_volume_ratio(df_s, n_bars=25)
             prox_sma50 = round((price - sma50) / sma50, 4) if sma50 > 0 else np.nan
 
+            # Estructura del diccionario respetando exactamente las posiciones de las columnas
             rows.append(
                 {
                     "Ticker": ticker,
@@ -534,7 +547,7 @@ def scan_market():
                     "ETF Referencia": ref_etf,
                     "Precio Actual": round(price, 2),
                     "Vol Promedio 20d": int(round(avg_vol_20d)),
-                    "RVOL (3d/20d)": round(rvol_3d_20d, 2),
+                    "RVOL (3d/20d)": round(rvol_3d_20d, 2),  # Variable reemplazada manteniendo su lugar ordinal
                     "Dry-Up (5d/50d)": round(dry_up_5d_vs_50d, 2)
                     if pd.notna(dry_up_5d_vs_50d)
                     else "",
@@ -551,7 +564,7 @@ def scan_market():
                     "Vs High 52": round(vs_high52, 4),
                     "RS vs SPY": round(rs_vs_spy_52w, 4),
                     "RS vs Sector": round(rs_vs_sector, 4),
-                    "Rank MktCap Industria": "",
+                    "Rank MktCap Industria": "",  # Se calculará tras el groupby por Industria
                     "OLS Acel 5w": round(ols_5w, 6) if pd.notna(ols_5w) else "",
                     "OLS Acel 30w": round(ols_30w, 6) if pd.notna(ols_30w) else "",
                     "Vol Prom 5d": int(round(avg_vol_5d)),
@@ -560,7 +573,8 @@ def scan_market():
                     if pd.notna(up_down_5w)
                     else "",
                     "Prox SMA 50": prox_sma50 if pd.notna(prox_sma50) else "",
-                    "AR": round(ar_val, 4) if pd.notna(ar_val) else "",
+                    "AR": round(ar_val, 4) if pd.notna(ar_val) else "",  # Nueva variable ubicada al final
+                    # Campos internos auxiliares para el cálculo de notas
                     "_market_cap": market_cap,
                     "_ud_ratio": up_down_5w,
                     "_rvol_3d_20d": rvol_3d_20d,
@@ -575,8 +589,11 @@ def scan_market():
     df_out = pd.DataFrame(rows)
     output_file = "oportunidades_minervini_filtradas.csv"
 
+    # --------------------------------------------------------------------------
+    # PASO 5C: CÁLCULO DE RANKING DE INDUSTRIA Y SCORES RE-CALIBRADOS
+    # --------------------------------------------------------------------------
     if not df_out.empty:
-        # Calcular Ranking por Industria
+        # Ranking de empresas por MarketCap agrupadas por Industria
         valid_mc = df_out["_market_cap"].notna() & (df_out["Industria"] != "Unknown")
         ranks = pd.Series(index=df_out.index, dtype="object")
         ranks.loc[valid_mc] = (
@@ -587,13 +604,13 @@ def scan_market():
         )
         df_out["Rank MktCap Industria"] = ranks.fillna("")
 
-        # Calcular Nuevos Scores
+        # Evaluación individual de las 3 sub-notas y el Score Total
         scores_acel = []
         scores_timing = []
         scores_rs = []
         scores_total = []
 
-        for idx, row in df_out.iterrows():
+        for _, row in df_out.iterrows():
             sc_acel = calc_score_aceleracion(row["_ar"])
             sc_tim = calc_score_timing(
                 row["_ud_ratio"], row["_rvol_3d_20d"], row["_dist_sma50"]
@@ -608,12 +625,13 @@ def scan_market():
             scores_rs.append(sc_rs)
             scores_total.append(sc_tot)
 
+        # Incorporación de las columnas de puntuación
         df_out["Score Aceleracion"] = scores_acel
         df_out["Score Timing"] = scores_timing
         df_out["Score Relative Strength"] = scores_rs
         df_out["Score Total"] = scores_total
 
-        # Limpiar columnas temporales de trabajo
+        # Limpieza de columnas auxiliares de cálculo interno
         temp_cols = [
             "_market_cap",
             "_ud_ratio",
@@ -624,9 +642,10 @@ def scan_market():
         ]
         df_out = df_out.drop(columns=temp_cols)
 
-        # Ordenar por Score Total descendente
+        # Ordenamiento final descendente por el Score Total
         df_out = df_out.sort_values(by="Score Total", ascending=False)
 
+        # Exportación del CSV filtrado y puntuado
         df_out.to_csv(output_file, index=False, encoding="utf-8-sig")
         print(
             f"✅ Guardadas {len(df_out)} candidatas en {output_file} ({time.time() - t0:.1f}s)"
